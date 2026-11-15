@@ -1,0 +1,265 @@
+name: Release
+
+# Start it from the Actions tab ("Run workflow") or with `just release feature`.
+# It works out the next version yy.nn.ff from the latest v* tag and today's
+# date, writes it everywhere, tests, commits, tags, builds and publishes.
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "feature: new features or breaking changes (yy.nn+1.0), fix: bug fixes only (yy.nn.ff+1)"
+        type: choice
+        options: [feature, fix]
+        default: feature
+      dry-run:
+        description: "Do everything except push, build and publish"
+        type: boolean
+        default: false
+
+# No permissions by default; every job asks for exactly what it needs.
+permissions: {}
+
+# Two releases at the same time would compute the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Version, test, tag
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      # No stored token: the tests run dependency build scripts, so the token
+      # is only handed to the final push step.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+
+      - name: Next version, files, tests, tag
+        id: release
+        env:
+          KIND: ${{ inputs.kind }}
+          DRY: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+
+          # Next version: from the latest tag and today's year. Without a tag
+          # yet, the first release is the version already in the files.
+          last=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          last=${last#v}
+          current=$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -n1)
+          if [ -z "$last" ]; then
+            next=$current
+          else
+            IFS=. read -r yy nn ff <<<"$last"
+            year=$((10#$(date -u +%y)))
+            if   [ "$year" -gt "$yy" ]; then next="$year.1.0"
+            elif [ "$KIND" = feature ];  then next="$yy.$((nn + 1)).0"
+            else                              next="$yy.$nn.$((ff + 1))"; fi
+          fi
+          echo "version=$next" >> "${GITHUB_OUTPUT:-/dev/null}"
+          echo "Release ${last:-none} -> $next"
+
+          # Write it everywhere.
+          sed -i "0,/^version = \".*\"/s//version = \"$next\"/" cli/Cargo.toml typst-package/typst.toml
+          { grep -rlE '@local/typst-form:[0-9]+\.[0-9]+\.[0-9]+' \
+              README.md typst-package book/src .github/ISSUE_TEMPLATE || true; } \
+            | xargs -r sed -i -E "s#@local/typst-form:[0-9]+\.[0-9]+\.[0-9]+#@local/typst-form:$next#"
+
+          # Changelog (Keep a Changelog): [Unreleased] becomes the release and
+          # the compare links at the bottom move along. The very first release
+          # uses the entry that is already there. "Empty" means no entries,
+          # only headings and link lines.
+          repo="https://github.com/${GITHUB_REPOSITORY:-yannickbecher/typst-form}"
+          if [ -n "$last" ]; then
+            body=$(awk '/^## /{if(f)exit} f{print} /^## \[Unreleased\]/{f=1}' CHANGELOG.md \
+              | { grep -vE '^(###|\[)' || true; } | tr -d '[:space:]')
+            [ -n "$body" ] || { echo "::error::write the changes under '## [Unreleased]' in CHANGELOG.md"; exit 1; }
+            sed -i -e "s/^## \[Unreleased\].*/## [Unreleased]\n\n## [$next] - $(date -u +%F)/" \
+                   -e "s#^\[Unreleased\]: .*#[Unreleased]: $repo/compare/v$next...HEAD\n[$next]: $repo/compare/v$last...v$next#" \
+              CHANGELOG.md
+          fi
+          grep -q "^## \[$next\] " CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no entry for $next"; exit 1; }
+
+          # Never release a broken build; the tests also check that the version
+          # is the same in the tool, the package, the docs and the changelog.
+          cargo test --manifest-path cli/Cargo.toml
+
+          if [ "$DRY" = true ]; then
+            git status --short
+            echo "Dry run: nothing committed or pushed."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Release $next"
+          git tag -a "v$next" -m "typst-form $next"
+
+      - name: Push commit and tag
+        if: ${{ !inputs.dry-run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.release.outputs.version }}
+        run: |
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          # Atomic: if main moved in the meantime, neither the commit nor the tag lands.
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push --atomic origin HEAD:main "v$V"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    if: ${{ !inputs.dry-run }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          # An older Linux image keeps the binary runnable on older glibc.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: typst-form
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: typst-form.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: typst-form
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: typst-form
+
+    steps:
+      # The tagged commit: `typst-form --version` shows the plain version.
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.prepare.outputs.version }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        working-directory: cli
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp README.md LICENSE-MIT LICENSE-APACHE cli/target/${{ matrix.target }}/release/
+          cd cli/target/${{ matrix.target }}/release
+          tar czf typst-form-${{ matrix.target }}.tar.gz ${{ matrix.artifact }} README.md LICENSE-MIT LICENSE-APACHE
+          mv typst-form-${{ matrix.target }}.tar.gz ../../../../
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cp README.md, LICENSE-MIT, LICENSE-APACHE cli/target/${{ matrix.target }}/release/
+          cd cli/target/${{ matrix.target }}/release
+          7z a typst-form-${{ matrix.target }}.zip ${{ matrix.artifact }} README.md LICENSE-MIT LICENSE-APACHE
+          mv typst-form-${{ matrix.target }}.zip ../../../../
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: typst-form-${{ matrix.target }}
+          path: typst-form-${{ matrix.target }}.*
+
+  release:
+    name: Publish release
+    needs: [prepare, build]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      V: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.prepare.outputs.version }}
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release notes and checksums
+        run: |
+          awk -v v="$V" '
+            /^## / { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          (cd artifacts && sha256sum * > SHA256SUMS)
+
+      # The GitHub CLI is preinstalled on the runner; no third-party action
+      # needs the write token.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$V" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" --title "$V" --notes-file notes.md --verify-tag
+
+  # The documentation (GitHub Pages) always describes the latest release.
+  # Needs Settings > Pages > Source: "GitHub Actions".
+  docs-build:
+    name: Build docs
+    needs: [prepare, release]
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.prepare.outputs.version }}
+          persist-credentials: false
+
+      - name: Build the book
+        run: |
+          curl -fsSL -o mdbook.tgz https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz
+          echo "9ef07fd288ba58ff3b99d1c94e6d414d431c9a61fdb20348e5beb74b823d546b  mdbook.tgz" | sha256sum -c -
+          tar -xzf mdbook.tgz
+          ./mdbook build book
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: book/book
+
+  docs-deploy:
+    name: Publish docs
+    needs: docs-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

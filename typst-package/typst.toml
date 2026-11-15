@@ -1,0 +1,15 @@
+[package]
+name = "typst-form"
+version = "26.1.0"
+description = "Fillable PDF forms: text fields, checkboxes, radio buttons, lists, buttons and signatures."
+
+authors = ["Yannick Becher <https://github.com/yannickbecher>"]
+repository = "https://github.com/yannickbecher/typst-form"
+
+keywords = ["form", "acroform", "pdf", "fillable", "fields", "javascript"]
+categories = ["components", "office"]
+
+license = "MIT OR Apache-2.0"
+
+compiler = "0.15.0"
+entrypoint = "src/lib.typ"

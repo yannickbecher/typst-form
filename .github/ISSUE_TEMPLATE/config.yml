@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/yannickbecher/typst-form/security/advisories/new
+    about: Please report security problems privately, not as a public issue.
+  - name: Documentation
+    url: https://yannickbecher.github.io/typst-form/
+    about: Fields, options, JavaScript, troubleshooting and limitations.

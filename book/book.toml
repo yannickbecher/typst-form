@@ -1,0 +1,12 @@
+[book]
+title = "typst-form"
+authors = ["Yannick Becher"]
+description = "Fillable PDF forms with Typst"
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/yannickbecher/typst-form"
+edit-url-template = "https://github.com/yannickbecher/typst-form/edit/main/book/{path}"
+# Project site: https://yannickbecher.github.io/typst-form/
+site-url = "/typst-form/"
