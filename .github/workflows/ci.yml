@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Test
+        working-directory: cli
+        run: cargo test --locked
+
+      - name: Build release
+        working-directory: cli
+        run: cargo build --release --locked
+
+      - name: CLI smoke test
+        run: |
+          ./cli/target/release/typst-form --version
+          ./cli/target/release/typst-form --help
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: Clippy
+        working-directory: cli
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        working-directory: cli
+        run: cargo fmt -- --check
+
+  docs:
+    name: Docs build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build the book
+        run: |
+          curl -fsSL -o mdbook.tgz https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz
+          echo "9ef07fd288ba58ff3b99d1c94e6d414d431c9a61fdb20348e5beb74b823d546b  mdbook.tgz" | sha256sum -c -
+          tar -xzf mdbook.tgz
+          ./mdbook build book
+
+  e2e:
+    name: End-to-end (typst compile --open typst-form)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Install Typst
+        uses: typst-community/setup-typst@v4
+
+      - name: Build CLI
+        working-directory: cli
+        run: cargo build --release --locked
+
+      - name: Compile examples and inject fields
+        run: |
+          mkdir -p out
+          for f in examples/*.typ cli/tests/*.typ; do
+            name=$(basename "$f" .typ)
+            typst compile --root . "$f" "out/$name.pdf"
+            ./cli/target/release/typst-form "out/$name.pdf" 2>&1 | tee -a out/inject.log
+          done
+          # Tagged PDF/UA-1 output must stay valid for Typst and the tool.
+          typst compile --root . --pdf-standard ua-1 cli/tests/accessible.typ out/accessible-ua.pdf
+          ./cli/target/release/typst-form out/accessible-ua.pdf 2>&1 | tee -a out/inject.log
+          # Every PDF must have carried embedded field data.
+          if grep "no form fields found" out/inject.log; then exit 1; fi
+
+      - name: Installed package imports as @local/typst-form
+        run: |
+          tool=./cli/target/release/typst-form
+          # `install` prints the exact import line (the package version, not
+          # the `--version` of a development build).
+          $tool install > out/import.typ
+          echo '#text-field("x")' >> out/import.typ
+          typst compile out/import.typ out/import.pdf
+          $tool out/import.pdf 2>&1 | tee out/import.log
+          if grep "no form fields found" out/import.log; then exit 1; fi
