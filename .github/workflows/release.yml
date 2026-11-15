@@ -25,18 +25,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Version, test, tag
+  # Runs the tests, which execute the build scripts of all dependencies. This
+  # job cannot write to the repository and nothing it produces is trusted.
+  check:
+    name: Version and tests
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
     outputs:
       version: ${{ steps.release.outputs.version }}
     steps:
-      # No stored token: the tests run dependency build scripts. The token is
-      # only handed to the final push step, which pushes from a fresh repository.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -44,100 +44,54 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Next version, files, commit
+      - name: Next version and files
         id: release
         env:
           KIND: ${{ inputs.kind }}
-          DRY: ${{ inputs.dry-run }}
-        run: |
-          set -euo pipefail
-
-          # Next version: from the latest tag and today's year. Without a tag
-          # yet, the first release is the version already in the files.
-          last=$(git tag --list 'v*' --sort=-v:refname | head -n1)
-          last=${last#v}
-          current=$(sed -n 's/^version = "\(.*\)"/\1/p' cli/Cargo.toml | head -n1)
-          if [ -z "$last" ]; then
-            next=$current
-          else
-            IFS=. read -r yy nn ff <<<"$last"
-            year=$((10#$(date -u +%y)))
-            if   [ "$year" -gt "$yy" ]; then next="$year.1.0"
-            elif [ "$KIND" = feature ];  then next="$yy.$((nn + 1)).0"
-            else                              next="$yy.$nn.$((ff + 1))"; fi
-          fi
-          echo "version=$next" >> "${GITHUB_OUTPUT:-/dev/null}"
-          echo "Release ${last:-none} -> $next"
-
-          # Write it everywhere.
-          sed -i "0,/^version = \".*\"/s//version = \"$next\"/" cli/Cargo.toml typst-package/typst.toml
-          { grep -rlE '@local/typst-form:[0-9]+\.[0-9]+\.[0-9]+' \
-              README.md typst-package book/src .github/ISSUE_TEMPLATE || true; } \
-            | xargs -r sed -i -E "s#@local/typst-form:[0-9]+\.[0-9]+\.[0-9]+#@local/typst-form:$next#"
-
-          # Changelog (Keep a Changelog): [Unreleased] becomes the release and
-          # the compare links at the bottom move along. The very first release
-          # uses the entry that is already there. "Empty" means no entries,
-          # only headings and link lines.
-          repo="https://github.com/${GITHUB_REPOSITORY:-yannickbecher/typst-form}"
-          if [ -n "$last" ]; then
-            body=$(awk '/^## /{if(f)exit} f{print} /^## \[Unreleased\]/{f=1}' CHANGELOG.md \
-              | { grep -vE '^(###|\[)' || true; } | tr -d '[:space:]')
-            [ -n "$body" ] || { echo "::error::write the changes under '## [Unreleased]' in CHANGELOG.md"; exit 1; }
-            sed -i -e "s/^## \[Unreleased\].*/## [Unreleased]\n\n## [$next] - $(date -u +%F)/" \
-                   -e "s#^\[Unreleased\]: .*#[Unreleased]: $repo/compare/v$next...HEAD\n[$next]: $repo/compare/v$last...v$next#" \
-              CHANGELOG.md
-          fi
-          grep -q "^## \[$next\] " CHANGELOG.md \
-            || { echo "::error::CHANGELOG.md has no entry for $next"; exit 1; }
-
-          # The version bump changes the lock file. `cargo metadata` updates it
-          # without running any build script, so the commit below is made
-          # before any dependency code runs.
-          cargo metadata --manifest-path cli/Cargo.toml --format-version 1 > /dev/null
-
-          if [ "$DRY" = true ]; then
-            git status --short
-            echo "Dry run: nothing is committed or pushed."
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -A
-            git diff --cached --quiet || git commit -m "Release $next"
-            echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT:-/dev/null}"
-          fi
+        run: bash .github/release-bump.sh
 
       # Never release a broken build; the tests also check that the version is
-      # the same in the tool, the package, the docs and the changelog. This runs
-      # dependency build scripts, so nothing after it trusts this working copy.
+      # the same in the tool, the package, the docs and the changelog.
       - name: Test
         run: cargo test --manifest-path cli/Cargo.toml
 
+  # Makes the release commit and the tag on a fresh runner. It runs no
+  # dependency code: only .github/release-bump.sh (sed, awk, git) and cargo's
+  # resolver, so the write token never meets untrusted code.
+  prepare:
+    name: Commit and tag
+    needs: check
+    if: ${{ !inputs.dry-run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Release commit
+        id: release
+        env:
+          KIND: ${{ inputs.kind }}
+          COMMIT: "true"
+          EXPECT_VERSION: ${{ needs.check.outputs.version }}
+        run: bash .github/release-bump.sh
+
       - name: Push commit and tag
-        if: ${{ !inputs.dry-run }}
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ steps.release.outputs.version }}
-          SHA: ${{ steps.release.outputs.sha }}
         run: |
-          set -euo pipefail
-          # Push from a fresh repository that holds only the commit made before
-          # the tests ran, with hooks off: whatever the tests wrote into the
-          # working copy (hooks, refs, config) cannot reach the token.
-          tmp=$(mktemp -d)
-          git init -q "$tmp"
-          git -C "$tmp" fetch -q "$GITHUB_WORKSPACE" HEAD
-          [ "$(git -C "$tmp" rev-parse FETCH_HEAD)" = "$SHA" ] \
-            || { echo "::error::the commit changed while the tests ran"; exit 1; }
-          git -C "$tmp" -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            tag -a "v$V" -m "typst-form $V" "$SHA"
+          git tag -a "v$V" -m "typst-form $V"
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
           # Atomic: if main moved in the meantime, neither the commit nor the tag lands.
-          git -C "$tmp" -c core.hooksPath=/dev/null \
-            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
-            push --atomic "https://github.com/$GITHUB_REPOSITORY.git" "$SHA:refs/heads/main" "refs/tags/v$V"
-
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push --atomic origin HEAD:main "v$V"
   build:
     name: Build ${{ matrix.target }}
     needs: prepare

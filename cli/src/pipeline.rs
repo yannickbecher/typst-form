@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use std::{fs, thread};
@@ -64,15 +65,28 @@ pub fn watch(pdf: &Path, mut on_change: impl FnMut()) -> ! {
 
 /// Write via a temporary file and rename, so readers never see a partial PDF.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    // The process id keeps two runs on the same file from sharing a temp file.
+    // Process id and clock keep the name unpredictable and two runs on the same
+    // file apart.
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}.tmp", std::process::id()));
+    tmp.push(format!(".{}-{nonce}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    if let Err(err) = fs::write(&tmp, bytes) {
+    // `create_new` (O_EXCL) never opens an existing file or follows a symlink
+    // planted at that name. Such a file is not ours, so it is left alone.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    if let Err(err) = file.write_all(bytes) {
         // A full disk must not leave a partial file next to the PDF.
+        drop(file);
         let _ = fs::remove_file(&tmp);
         return Err(err).with_context(|| format!("failed to write {}", tmp.display()));
     }
+    drop(file);
     fs::rename(&tmp, path).map_err(|err| {
         let _ = fs::remove_file(&tmp);
         anyhow::anyhow!(
@@ -96,6 +110,23 @@ mod tests {
 
     /// `cli/tests/umlaute.typ` compiled by Typst, before injection.
     const FIXTURE: &[u8] = include_bytes!("../tests/umlaute.pdf");
+
+    #[test]
+    fn write_atomic_replaces_the_file_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("typst-form-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("out.pdf");
+        fs::write(&target, b"old").unwrap();
+        write_atomic(&target, b"new").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn injects_fields_and_removes_attachment() {
